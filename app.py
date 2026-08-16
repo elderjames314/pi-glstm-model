@@ -166,6 +166,7 @@ if uploaded_file is not None:
         st.success(f"✅ Inference Completed in {inf_time:.2f} ms")
 
         # Key Comparative Metrics Banner
+        # Key Comparative Metrics Banner
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Processed Sequences", len(plot_x))
         m2.metric("Baseline SoH", f"{float(base_soh[-1]):.2f} %")
@@ -174,9 +175,14 @@ if uploaded_file is not None:
             f"{float(guarded_pi_soh[-1]):.2f} %",
             delta=f"{float(guarded_pi_soh[-1] - base_soh[-1]):.2f}% vs Base",
         )
-        m4.metric("Baseline EOL Cycle", f"Seq #{base_eol_idx}" if base_eol_idx is not None else "N/A")
-        m5.metric("PI-GLSTM EOL Cycle", f"Seq #{pi_eol_idx}" if pi_eol_idx is not None else "N/A")
-
+        m4.metric(
+            "Baseline EOL Cycle", 
+            f"Seq #{base_eol_idx}" if base_eol_idx is not None and base_eol_idx > 0 else ("At Start" if base_eol_idx == 0 else "N/A")
+        )
+        m5.metric(
+            "PI-GLSTM EOL Cycle", 
+            f"Seq #{pi_eol_idx}" if pi_eol_idx is not None and pi_eol_idx > 0 else ("At Start" if pi_eol_idx == 0 else "N/A")
+        )
         # Comparative Visualization
         fig, ax = plt.subplots(figsize=(10, 4.5))
         fig.patch.set_facecolor("#0e1117")

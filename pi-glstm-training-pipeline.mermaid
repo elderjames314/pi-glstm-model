@@ -1,33 +1,48 @@
-flowchart LR
-    A[Battery Dataset] --> B[Data Preprocessing]
-    B --> C[Feature Selection]
-    C --> D[Feature Scaling]
-    D --> E[Chronological Sequence Generation]
+flowchart TD
+    %% Data Preparation Pipeline
+    subgraph Data_Prep ["1. Data Preparation"]
+        A[Battery Dataset] --> B[Data Preprocessing]
+        B --> C[Feature Selection]
+        C --> D[Feature Scaling]
+        D --> E[Chronological Sequence Generation]
+    end
 
-    E --> F[Train Set]
-    E --> G[Validation Set]
-    E --> H[Test Set]
+    %% Dataset Splitting
+    subgraph Splits ["2. Dataset Splits"]
+        E --> F[Train Set]
+        E --> G[Validation Set]
+        E --> H[Test Set]
+    end
 
-    F --> I[PI-GLSTM Model]
+    %% Model Architecture
+    subgraph Architecture ["3. PI-GLSTM Architecture"]
+        F --> I[PI-GLSTM Model]
+        I --> I1[LSTM Temporal Encoder]
+        I1 --> I2[SoH Degradation Head]
+        I1 --> I3[RUL Prediction Head]
+        
+        I2 --> I4[Softplus]
+        I4 --> I5[Non-negative Degradation Increment]
+        I5 --> I6[Cumulative Degradation]
+        I6 --> I7[SoH Trajectory]
+        
+        I3 --> J[RUL Prediction]
+    end
 
-    I --> I1[LSTM Temporal Encoder]
-    I1 --> I2[SoH Degradation Head]
-    I1 --> I3[RUL Prediction Head]
+    %% Optimization & Validation
+    subgraph Optimization ["4. Model Optimization & Evaluation"]
+        I7 --> K[Composite Loss]
+        J --> K
+        K --> N[Backpropagation]
+        N -. Loop .-x I
 
-    I2 --> I4[Softplus]
-    I4 --> I5[Non-negative Degradation Increment]
-    I5 --> I6[Cumulative Degradation]
-    I6 --> I7[SoH Trajectory]
+        G --> L[Validation Loss]
+        L --> M[Early Stopping / Best Model Restoration]
+        M --> O[Trained PI-GLSTM]
+    end
 
-    I3 --> J[RUL Prediction]
-
-    I7 --> K[Composite Loss]
-    J --> K
-
-    G --> L[Validation Loss]
-    L --> M[Early Stopping / Best Model Restoration]
-
-    K --> N[Backpropagation]
-    N --> I
-
-    M --> O[Trained PI-GLSTM]
+    %% Styling
+    style Data_Prep fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style Splits fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style Architecture fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style Optimization fill:#f9f9f9,stroke:#333,stroke-width:1px

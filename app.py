@@ -1,41 +1,49 @@
 
-# ============================================================
-# PI-GLSTM BATTERY PROGNOSTICS DASHBOARD
-# Baseline LSTM / Objective 1 PI-GLSTM / Objective 2 Transfer
-# ============================================================
+from __future__ import annotations
 
+import pickle
+import hashlib
 from pathlib import Path
-import time
-import warnings
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-warnings.filterwarnings("ignore", category=UserWarning)
 
 # ============================================================
-# CONFIGURATION
+# APPLICATION CONFIGURATION
 # ============================================================
 
-APP_TITLE = "PI-GLSTM Battery Prognostics Dashboard"
-ARTIFACT_DIR = Path("model_artifacts")
+st.set_page_config(
+    page_title="Battery Prognostics | Streaming",
+    page_icon="🔋",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+APP_DIR = Path(__file__).resolve().parent
+ARTIFACT_DIR = APP_DIR / "model_artifacts"
 
 SEQ_LEN = 10
 INPUT_SIZE = 4
 HIDDEN_SIZE = 64
-DROPOUT = 0.2
 
-FEATURES = ["cycle", "voltage", "temperature", "capacity"]
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+FEATURES = [
+    "cycle",
+    "voltage",
+    "temperature",
+    "capacity",
+]
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 MODEL_FILES = {
     "Baseline LSTM": {
@@ -53,26 +61,27 @@ MODEL_FILES = {
         "model": ARTIFACT_DIR / "pi_glstm_obj2_transfer_state_dict.pt",
         "x_scaler": ARTIFACT_DIR / "x_scaler_obj2.pkl",
         "rul_scaler": ARTIFACT_DIR / "rul_scaler_obj2.pkl",
+        "initial_capacity": ARTIFACT_DIR / "initial_capacity_obj2.pkl",
     },
 }
 
-MODEL_ORDER = [
-    "Baseline LSTM",
-    "Objective 1 PI-GLSTM",
-    "Objective 2 Transfer PI-GLSTM",
-]
-
 MODEL_COLORS = {
-    "Baseline LSTM": "#64748b",
-    "Objective 1 PI-GLSTM": "#2563eb",
-    "Objective 2 Transfer PI-GLSTM": "#db2777",
+    "Baseline LSTM": "#2563EB",
+    "Objective 1 PI-GLSTM": "#16A34A",
+    "Objective 2 Transfer PI-GLSTM": "#9333EA",
 }
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🔋",
-    layout="wide",
-)
+SOH_COLUMNS = {
+    "Baseline LSTM": "Baseline LSTM SoH",
+    "Objective 1 PI-GLSTM": "Objective 1 PI-GLSTM SoH",
+    "Objective 2 Transfer PI-GLSTM": "Objective 2 Transfer PI-GLSTM SoH",
+}
+
+RUL_COLUMNS = {
+    "Baseline LSTM": "Baseline LSTM RUL",
+    "Objective 1 PI-GLSTM": "Objective 1 PI-GLSTM RUL",
+    "Objective 2 Transfer PI-GLSTM": "Objective 2 Transfer PI-GLSTM RUL",
+}
 
 
 # ============================================================
@@ -81,25 +90,23 @@ st.set_page_config(
 
 class BaselineLSTM(nn.Module):
     """
-    Reconstructed from the baseline checkpoint parameter shapes:
+    Baseline architecture inferred from the exported state-dict
+    tensor dimensions:
+
         LSTM(input=4, hidden=64)
         Linear(64, 32)
         ReLU
         Linear(32, 2)
 
-    Output columns:
-        0: transformed/scaled SoH
-        1: scaled RUL
-
-    Confirm this forward pass against the original training class
-    if that source code becomes available.
+    Output:
+        [:, 0] = normalized SoH
+        [:, 1] = scaled RUL
     """
 
     def __init__(
         self,
-        input_size=INPUT_SIZE,
-        hidden_size=HIDDEN_SIZE,
-        fc_size=32,
+        input_size: int = INPUT_SIZE,
+        hidden_size: int = HIDDEN_SIZE,
     ):
         super().__init__()
 
@@ -108,34 +115,52 @@ class BaselineLSTM(nn.Module):
             hidden_size=hidden_size,
             batch_first=True,
         )
-        self.fc = nn.Linear(hidden_size, fc_size)
-        self.out = nn.Linear(fc_size, 2)
+        self.fc = nn.Linear(hidden_size, 32)
+        self.out = nn.Linear(32, 2)
 
     def forward(self, x):
         _, (h_n, _) = self.lstm(x)
-        last_h = h_n[-1]
-        return self.out(F.relu(self.fc(last_h)))
+        last_hidden = h_n[-1]
+        z = F.relu(self.fc(last_hidden))
+        return self.out(z)
 
 
 class GuardedLSTMCell(nn.Module):
-    """Guarded LSTM cell used by both PI-GLSTM models."""
+    """
+    PI-GLSTM cell with a guarded degradation state.
+    """
 
-    def __init__(self, input_size, hidden_size):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+    ):
         super().__init__()
 
         self.hidden_size = hidden_size
-        self.x_gates = nn.Linear(input_size, 4 * hidden_size)
+
+        self.x_gates = nn.Linear(
+            input_size,
+            4 * hidden_size,
+        )
         self.h_gates = nn.Linear(
             hidden_size,
             4 * hidden_size,
             bias=False,
         )
-        self.decay = nn.Linear(input_size + hidden_size, 1)
+        self.decay = nn.Linear(
+            input_size + hidden_size,
+            1,
+        )
 
     def forward(self, x_t, state):
         h_prev, c_prev = state
 
-        gates = self.x_gates(x_t) + self.h_gates(h_prev)
+        gates = (
+            self.x_gates(x_t)
+            + self.h_gates(h_prev)
+        )
+
         i, f, g, o = gates.chunk(4, dim=-1)
 
         i = torch.sigmoid(i)
@@ -147,7 +172,9 @@ class GuardedLSTMCell(nn.Module):
         h_standard = o * torch.tanh(c_standard)
 
         decay = F.softplus(
-            self.decay(torch.cat([x_t, h_prev], dim=-1))
+            self.decay(
+                torch.cat([x_t, h_prev], dim=-1)
+            )
         )
 
         c_guard = c_prev[:, :1] - decay
@@ -166,1106 +193,1296 @@ class GuardedLSTMCell(nn.Module):
 
 
 class BasePIGLSTM(nn.Module):
-    """Objective 1: non-negative degradation prediction and scaled RUL."""
+    """
+    Objective 1:
+    Non-negative degradation increment and scaled RUL output.
+    """
 
     def __init__(
         self,
-        input_size=INPUT_SIZE,
-        hidden=HIDDEN_SIZE,
-        dropout=DROPOUT,
+        input_size: int = INPUT_SIZE,
+        hidden_size: int = HIDDEN_SIZE,
+        dropout: float = 0.2,
     ):
         super().__init__()
 
-        self.hidden_size = hidden
-        self.cell = GuardedLSTMCell(input_size, hidden)
-        self.drop = nn.Dropout(dropout)
+        self.hidden_size = hidden_size
 
-        self.delta_head = nn.Linear(hidden, 1)
-        self.rul_fc = nn.Linear(hidden, hidden // 2)
-        self.rul_head = nn.Linear(hidden // 2, 1)
+        self.cell = GuardedLSTMCell(
+            input_size,
+            hidden_size,
+        )
 
-        self.last_guarded_cell = None
-        self.last_guarded_hidden = None
+        self.dropout = nn.Dropout(dropout)
+
+        self.delta_head = nn.Linear(
+            hidden_size,
+            1,
+        )
+
+        self.rul_fc = nn.Linear(
+            hidden_size,
+            hidden_size // 2,
+        )
+
+        self.rul_head = nn.Linear(
+            hidden_size // 2,
+            1,
+        )
 
     def forward(self, x):
-        batch_size, steps, _ = x.shape
+        batch_size, seq_len, _ = x.shape
 
-        h = x.new_zeros(batch_size, self.hidden_size)
-        c = x.new_zeros(batch_size, self.hidden_size)
+        h = torch.zeros(
+            batch_size,
+            self.hidden_size,
+            device=x.device,
+        )
+        c = torch.zeros_like(h)
 
-        guarded_h = []
-        guarded_c = []
+        for t in range(seq_len):
+            h, c = self.cell(
+                x[:, t, :],
+                (h, c),
+            )
 
-        for t in range(steps):
-            h, c = self.cell(x[:, t, :], (h, c))
-            guarded_h.append(h[:, 0])
-            guarded_c.append(c[:, 0])
+        h = self.dropout(h)
 
-        self.last_guarded_hidden = torch.stack(guarded_h, dim=1)
-        self.last_guarded_cell = torch.stack(guarded_c, dim=1)
+        delta = F.softplus(
+            self.delta_head(h)
+        ).squeeze(-1)
 
-        z = self.drop(h)
-
-        delta = F.softplus(self.delta_head(z)).squeeze(-1)
         rul_scaled = self.rul_head(
-            torch.relu(self.rul_fc(z))
+            F.relu(self.rul_fc(h))
         ).squeeze(-1)
 
         return delta, rul_scaled
 
 
 class TransferPIGLSTM(nn.Module):
-    """Objective 2: anchor-conditioned SoH and scaled RUL prediction."""
+    """
+    Objective 2:
+    Transfer PI-GLSTM with a relative-health head and RUL head.
+    """
 
     def __init__(
         self,
-        input_size=INPUT_SIZE,
-        hidden=HIDDEN_SIZE,
-        dropout=DROPOUT,
+        input_size: int = INPUT_SIZE,
+        hidden_size: int = HIDDEN_SIZE,
+        dropout: float = 0.2,
     ):
         super().__init__()
 
-        self.hidden_size = hidden
-        self.cell = GuardedLSTMCell(input_size, hidden)
-        self.drop = nn.Dropout(dropout)
+        self.hidden_size = hidden_size
 
-        self.soh_head = nn.Linear(hidden, 1)
-        self.rul_fc = nn.Linear(hidden, hidden // 2)
-        self.rul_head = nn.Linear(hidden // 2, 1)
+        self.cell = GuardedLSTMCell(
+            input_size,
+            hidden_size,
+        )
 
-        self.last_guarded_cell = None
-        self.last_guarded_hidden = None
+        self.dropout = nn.Dropout(dropout)
+
+        self.soh_head = nn.Linear(
+            hidden_size,
+            1,
+        )
+
+        self.rul_fc = nn.Linear(
+            hidden_size,
+            hidden_size // 2,
+        )
+
+        self.rul_head = nn.Linear(
+            hidden_size // 2,
+            1,
+        )
 
     def forward(self, x, anchor_soh):
-        batch_size, steps, _ = x.shape
+        batch_size, seq_len, _ = x.shape
 
-        h = x.new_zeros(batch_size, self.hidden_size)
-        c = x.new_zeros(batch_size, self.hidden_size)
+        h = torch.zeros(
+            batch_size,
+            self.hidden_size,
+            device=x.device,
+        )
+        c = torch.zeros_like(h)
 
-        guarded_h = []
-        guarded_c = []
+        for t in range(seq_len):
+            h, c = self.cell(
+                x[:, t, :],
+                (h, c),
+            )
 
-        for t in range(steps):
-            h, c = self.cell(x[:, t, :], (h, c))
-            guarded_h.append(h[:, 0])
-            guarded_c.append(c[:, 0])
-
-        self.last_guarded_hidden = torch.stack(guarded_h, dim=1)
-        self.last_guarded_cell = torch.stack(guarded_c, dim=1)
-
-        last_h = self.drop(h)
+        h = self.dropout(h)
 
         relative_health = torch.sigmoid(
-            self.soh_head(last_h)
+            self.soh_head(h)
         ).squeeze(-1)
 
-        soh = anchor_soh.reshape(-1).clamp(0.0, 1.0)
-        soh = soh * relative_health
+        soh = (
+            torch.clamp(anchor_soh, 0.0, 1.0)
+            * relative_health
+        )
 
         rul_scaled = self.rul_head(
-            torch.relu(self.rul_fc(last_h))
+            F.relu(self.rul_fc(h))
         ).squeeze(-1)
 
         return soh, rul_scaled
 
 
 # ============================================================
-# COLUMN STANDARDIZATION AND DATA PREPARATION
+# ARTIFACT LOADING
 # ============================================================
 
-COLUMN_ALIASES = {
-    "cycle": ["cycle", "cycles", "cycle_number", "cycle_index"],
-    "battery_id": ["battery_id", "battery", "batteryid", "unit_id"],
-    "voltage": [
-        "voltage", "voltage_measured", "voltage_load",
-        "mean_voltage", "avg_voltage",
-    ],
-    "temperature": [
-        "temperature", "temperature_measured", "temp",
-        "mean_temperature", "avg_temperature",
-    ],
-    "capacity": [
-        "capacity", "discharge_capacity", "measured_capacity",
-        "capacity_ah",
-    ],
-    "soh": ["soh", "state_of_health", "actual_soh"],
-    "rul": ["rul", "remaining_useful_life", "actual_rul"],
-}
+def load_pickle(path: Path) -> Any:
+    """
+    Load an exported scaler or pickle artifact.
+    """
+    try:
+        return joblib.load(path)
+    except Exception:
+        with path.open("rb") as f:
+            return pickle.load(f)
 
 
-def standardize_columns(df):
-    df = df.copy()
-    df.columns = [
-        str(c).strip().lower().replace(" ", "_").replace("-", "_")
-        for c in df.columns
-    ]
+def load_checkpoint(path: Path) -> dict:
+    try:
+        checkpoint = torch.load(
+            path,
+            map_location=DEVICE,
+            weights_only=True,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            path,
+            map_location=DEVICE,
+        )
 
-    rename = {}
-
-    for canonical, aliases in COLUMN_ALIASES.items():
-        for alias in aliases:
-            if alias in df.columns:
-                rename[alias] = canonical
+    if isinstance(checkpoint, dict):
+        for key in (
+            "state_dict",
+            "model_state_dict",
+            "model",
+        ):
+            if key in checkpoint and isinstance(
+                checkpoint[key], dict
+            ):
+                checkpoint = checkpoint[key]
                 break
 
-    df = df.rename(columns=rename)
-
-    if "battery_id" not in df.columns:
-        df["battery_id"] = "B0005"
-
-    return df
-
-
-def prepare_cycle_data(uploaded_df):
-    df = standardize_columns(uploaded_df)
-
-    required = ["cycle", "voltage", "temperature", "capacity"]
-    missing = [c for c in required if c not in df.columns]
-
-    if missing:
-        raise ValueError(
-            f"Missing required columns: {missing}. Required: "
-            "cycle, voltage, temperature, capacity. Aggregate raw "
-            "telemetry into cycle-level rows first."
-        )
-
-    soh_was_supplied = "soh" in df.columns
-    rul_was_supplied = "rul" in df.columns
-
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if soh_was_supplied:
-        df["soh"] = pd.to_numeric(df["soh"], errors="coerce")
-
-    if rul_was_supplied:
-        df["rul"] = pd.to_numeric(df["rul"], errors="coerce")
-
-    df["battery_id"] = df["battery_id"].astype(str)
-
-    df = df.dropna(subset=required)
-    df = df.sort_values(
-        ["battery_id", "cycle"]
-    ).reset_index(drop=True)
-
-    if df.empty:
-        raise ValueError("No valid cycle-level rows remain after cleaning.")
-
-    if not soh_was_supplied:
-        initial_capacity = (
-            df.groupby("battery_id")["capacity"]
-            .transform("first")
-            .replace(0, np.nan)
-        )
-        df["soh"] = df["capacity"] / initial_capacity
-    else:
-        valid_soh = df["soh"].dropna()
-        if not valid_soh.empty and valid_soh.max() > 1.5:
-            df["soh"] = df["soh"] / 100.0
-
-    if not rul_was_supplied:
-        df["rul"] = (
-            df.groupby("battery_id")["cycle"].transform("max")
-            - df["cycle"]
-        )
-
-    return df, soh_was_supplied, rul_was_supplied
-
-
-# ============================================================
-# MODEL LOADING
-# ============================================================
-
-def extract_state_dict(checkpoint):
     if not isinstance(checkpoint, dict):
-        raise ValueError("Checkpoint is not a dictionary.")
+        raise ValueError(
+            f"Unsupported checkpoint format: {path.name}"
+        )
 
-    for key in ("model_state_dict", "state_dict"):
-        candidate = checkpoint.get(key)
-        if isinstance(candidate, dict):
-            return candidate
+    # Remove DataParallel prefixes if present.
+    return {
+        key.removeprefix("module."): value
+        for key, value in checkpoint.items()
+    }
 
-    if checkpoint and all(
-        torch.is_tensor(value) for value in checkpoint.values()
-    ):
-        return checkpoint
+
+def extract_scalar(value: Any) -> float:
+    """
+    Read a scalar or scalar-containing exported artifact.
+    """
+    if isinstance(value, dict):
+        for key in (
+            "initial_capacity",
+            "capacity",
+            "value",
+        ):
+            if key in value:
+                return extract_scalar(value[key])
+
+    if isinstance(value, (list, tuple, np.ndarray)):
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        if len(arr):
+            return float(arr[0])
+
+    return float(value)
+
+
+def load_baseline_output_scaling(path: Path) -> tuple[float, float]:
+    """
+    Expected export:
+        {"soh_scale": ..., "soh_mean": ...}
+
+    Also accepts a two-element sequence:
+        (soh_scale, soh_mean)
+    """
+    obj = load_pickle(path)
+
+    if isinstance(obj, dict):
+        if "soh_scale" in obj and "soh_mean" in obj:
+            return (
+                float(obj["soh_scale"]),
+                float(obj["soh_mean"]),
+            )
+
+        if "scale" in obj and "mean" in obj:
+            return (
+                float(obj["scale"]),
+                float(obj["mean"]),
+            )
+
+    if isinstance(obj, (tuple, list, np.ndarray)):
+        values = np.asarray(obj, dtype=float).reshape(-1)
+
+        if len(values) >= 2:
+            return float(values[0]), float(values[1])
 
     raise ValueError(
-        "Could not identify a raw state_dict or model_state_dict."
+        "Baseline output scaling must contain "
+        "'soh_scale' and 'soh_mean', or a two-value sequence."
     )
 
 
-def inverse_rul(scaler, scaled_value):
-    value = np.asarray([[scaled_value]], dtype=np.float64)
-    return float(scaler.inverse_transform(value)[0, 0])
-
-
-@st.cache_resource
-def load_available_models():
+@st.cache_resource(show_spinner="Loading trained models...")
+def load_models():
     """
-    Load each model independently. A failure for one model does not
-    prevent other valid models from loading.
-    """
+    Models are loaded once and reused between Streamlit reruns.
 
+    A model with missing artifacts is marked unavailable while
+    the other models can still run.
+    """
     models = {}
     errors = {}
 
+    architectures = {
+        "Baseline LSTM": BaselineLSTM,
+        "Objective 1 PI-GLSTM": BasePIGLSTM,
+        "Objective 2 Transfer PI-GLSTM": TransferPIGLSTM,
+    }
+
     for name, paths in MODEL_FILES.items():
-        required_paths = [
-            paths["model"],
-            paths["x_scaler"],
-            paths["rul_scaler"],
-        ]
-
-        if name == "Baseline LSTM":
-            required_paths.append(paths["output_scaling"])
-
-        missing = [str(path) for path in required_paths if not path.is_file()]
-
-        if missing:
-            errors[name] = "Missing artifacts: " + ", ".join(missing)
-            continue
-
         try:
+            required = [
+                paths["model"],
+                paths["x_scaler"],
+                paths["rul_scaler"],
+            ]
+
             if name == "Baseline LSTM":
-                model = BaselineLSTM(
-                    input_size=INPUT_SIZE,
-                    hidden_size=HIDDEN_SIZE,
-                    fc_size=32,
-                )
-            elif name == "Objective 1 PI-GLSTM":
-                model = BasePIGLSTM(
-                    input_size=INPUT_SIZE,
-                    hidden=HIDDEN_SIZE,
-                    dropout=DROPOUT,
-                )
-            else:
-                model = TransferPIGLSTM(
-                    input_size=INPUT_SIZE,
-                    hidden=HIDDEN_SIZE,
-                    dropout=DROPOUT,
+                required.append(paths["output_scaling"])
+
+            missing = [
+                p.name for p in required if not p.exists()
+            ]
+
+            if missing:
+                raise FileNotFoundError(
+                    "Missing artifact(s): " + ", ".join(missing)
                 )
 
-            checkpoint = torch.load(
-                paths["model"],
-                map_location="cpu",
-                weights_only=True,
-            )
+            model = architectures[name]()
+
+            state_dict = load_checkpoint(paths["model"])
 
             model.load_state_dict(
-                extract_state_dict(checkpoint),
+                state_dict,
                 strict=True,
             )
 
             model.to(DEVICE)
             model.eval()
 
-            x_scaler = joblib.load(paths["x_scaler"])
-            rul_scaler = joblib.load(paths["rul_scaler"])
+            x_scaler = load_pickle(paths["x_scaler"])
+            rul_scaler = load_pickle(paths["rul_scaler"])
 
-            if not hasattr(x_scaler, "transform"):
-                raise ValueError("Feature scaler has no transform() method.")
-
-            if not hasattr(rul_scaler, "inverse_transform"):
-                raise ValueError("RUL scaler has no inverse_transform().")
-
-            entry = {
+            item = {
                 "model": model,
                 "x_scaler": x_scaler,
                 "rul_scaler": rul_scaler,
             }
 
             if name == "Baseline LSTM":
-                scaling = joblib.load(paths["output_scaling"])
+                (
+                    item["soh_scale"],
+                    item["soh_mean"],
+                ) = load_baseline_output_scaling(
+                    paths["output_scaling"]
+                )
 
-                if not isinstance(scaling, dict):
-                    raise ValueError(
-                        "Baseline output scaling must be a dictionary."
+            if name == "Objective 2 Transfer PI-GLSTM":
+                capacity_path = paths.get("initial_capacity")
+
+                if capacity_path and capacity_path.exists():
+                    item["initial_capacity"] = extract_scalar(
+                        load_pickle(capacity_path)
                     )
+                else:
+                    item["initial_capacity"] = None
 
-                if not {"soh_scale", "soh_mean"}.issubset(scaling):
-                    raise ValueError(
-                        "Baseline output scaling must contain "
-                        "'soh_scale' and 'soh_mean'."
-                    )
-
-                entry["soh_scale"] = float(scaling["soh_scale"])
-                entry["soh_mean"] = float(scaling["soh_mean"])
-
-                if (
-                    not np.isfinite(entry["soh_scale"])
-                    or entry["soh_scale"] == 0
-                    or not np.isfinite(entry["soh_mean"])
-                ):
-                    raise ValueError(
-                        "Invalid baseline SoH scaling values."
-                    )
-
-            models[name] = entry
+            models[name] = item
 
         except Exception as exc:
-            errors[name] = f"{type(exc).__name__}: {exc}"
+            errors[name] = str(exc)
 
     return models, errors
 
 
 # ============================================================
-# PREDICTIONS
+# DATASET PREPARATION
 # ============================================================
 
-def run_predictions(df, artifacts, selected_battery, max_cycles=None):
-    battery_df = (
-        df[df["battery_id"].astype(str) == str(selected_battery)]
-        .sort_values("cycle")
-        .reset_index(drop=True)
-        .copy()
+def normalise_column_name(name: str) -> str:
+    return (
+        str(name)
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("%", "percent")
     )
 
-    if len(battery_df) <= SEQ_LEN:
+
+def prepare_battery_data(raw: pd.DataFrame):
+    """
+    Normalise common column aliases, sort cycles, and create
+    optional reference values.
+
+    Explicitly supplied SoH/RUL values are distinguished from
+    values derived as proxies.
+    """
+    df = raw.copy()
+    df.columns = [
+        normalise_column_name(c)
+        for c in df.columns
+    ]
+
+    aliases = {
+        "cycle": [
+            "cycle",
+            "cycles",
+            "cycle_number",
+            "cycle_index",
+        ],
+        "voltage": [
+            "voltage",
+            "voltage_measured",
+            "terminal_voltage",
+            "voltage_v",
+        ],
+        "temperature": [
+            "temperature",
+            "temperature_measured",
+            "temp",
+            "temperature_c",
+        ],
+        "capacity": [
+            "capacity",
+            "capacity_measured",
+            "discharge_capacity",
+            "battery_capacity",
+        ],
+        "soh": [
+            "soh",
+            "state_of_health",
+            "state_health",
+            "soh_percent",
+            "capacity_retention",
+        ],
+        "rul": [
+            "rul",
+            "remaining_useful_life",
+            "remaining_cycles",
+            "remaining_life",
+        ],
+    }
+
+    rename = {}
+
+    for canonical, candidates in aliases.items():
+        for candidate in candidates:
+            if candidate in df.columns:
+                rename[candidate] = canonical
+                break
+
+    df = df.rename(columns=rename)
+
+    missing_features = [
+        col for col in FEATURES
+        if col not in df.columns
+    ]
+
+    if missing_features:
         raise ValueError(
-            f"Battery {selected_battery} has {len(battery_df)} rows. "
-            f"At least {SEQ_LEN + 1} are required."
+            "The uploaded CSV is missing required columns: "
+            + ", ".join(missing_features)
+            + ". Expected cycle, voltage, temperature, capacity."
         )
 
-    if max_cycles and max_cycles > 0:
-        battery_df = battery_df.iloc[:SEQ_LEN + max_cycles].copy()
+    df = df.copy()
 
-    scaled_features = {}
-
-    for name, entry in artifacts.items():
-        transformed = entry["x_scaler"].transform(
-            battery_df[FEATURES]
+    for col in FEATURES:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
         )
 
-        if transformed.ndim != 2 or transformed.shape[1] != INPUT_SIZE:
-            raise ValueError(
-                f"{name}: scaler must output {INPUT_SIZE} features; "
-                f"received shape {transformed.shape}."
+    has_soh_reference = "soh" in df.columns
+    has_rul_reference = "rul" in df.columns
+
+    if has_soh_reference:
+        df["soh"] = pd.to_numeric(
+            df["soh"],
+            errors="coerce",
+        )
+
+    if has_rul_reference:
+        df["rul"] = pd.to_numeric(
+            df["rul"],
+            errors="coerce",
+        )
+
+    df = (
+        df.dropna(subset=FEATURES)
+        .sort_values("cycle")
+        .drop_duplicates(subset=["cycle"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    if len(df) <= SEQ_LEN:
+        raise ValueError(
+            f"At least {SEQ_LEN + 1} valid cycles are required."
+        )
+
+    if (df["capacity"] <= 0).all():
+        raise ValueError(
+            "Capacity values must include positive measurements."
+        )
+
+    initial_capacity = float(df["capacity"].iloc[0])
+
+    if initial_capacity <= 0:
+        raise ValueError(
+            "The first valid capacity must be positive."
+        )
+
+    # Measured SoH is preferred when supplied.
+    if has_soh_reference:
+        df["soh"] = df["soh"].where(
+            df["soh"].notna(),
+            np.nan,
+        )
+
+        valid_soh = df["soh"].dropna()
+
+        if not valid_soh.empty and valid_soh.max() > 1.5:
+            df["soh"] = df["soh"] / 100.0
+
+        df["soh"] = df["soh"].clip(0.0, 1.2)
+        df["_soh_reference"] = df["soh"]
+        df["_soh_reference_label"] = "Supplied SoH reference"
+    else:
+        df["_soh_reference"] = (
+            df["capacity"] / initial_capacity
+        ).clip(0.0, 1.2)
+        df["_soh_reference_label"] = (
+            "Capacity-derived SoH proxy"
+        )
+
+    # Supplied RUL is preferred when available.
+    if has_rul_reference:
+        df["_rul_reference"] = df["rul"]
+        df["_rul_reference_label"] = "Supplied RUL reference"
+    else:
+        max_cycle = float(df["cycle"].max())
+        df["_rul_reference"] = (
+            max_cycle - df["cycle"]
+        ).clip(lower=0)
+        df["_rul_reference_label"] = (
+            "Cycle-derived RUL proxy"
+        )
+
+    return df, initial_capacity, has_soh_reference, has_rul_reference
+
+
+def inverse_rul(scaler, value: float) -> float:
+    arr = np.asarray([[value]], dtype=float)
+    return float(scaler.inverse_transform(arr)[0, 0])
+
+
+def scale_input(scaler, raw_window: pd.DataFrame) -> torch.Tensor:
+    values = raw_window[FEATURES].to_numpy(dtype=np.float32)
+    scaled = scaler.transform(values)
+
+    return torch.as_tensor(
+        scaled,
+        dtype=torch.float32,
+        device=DEVICE,
+    ).unsqueeze(0)
+
+
+# ============================================================
+# SINGLE-CYCLE INFERENCE
+# ============================================================
+
+@torch.inference_mode()
+def predict_one_cycle(
+    models: dict,
+    df: pd.DataFrame,
+    step_index: int,
+    previous_obj1_soh: float,
+    dataset_initial_capacity: float,
+):
+    """
+    Process one sliding window and return this cycle's outputs.
+
+    step_index 0 corresponds to the first complete 10-step window.
+    """
+    end_idx = SEQ_LEN - 1 + step_index
+    start_idx = end_idx - SEQ_LEN + 1
+
+    raw_window = df.iloc[start_idx:end_idx + 1]
+
+    if len(raw_window) != SEQ_LEN:
+        raise ValueError("Invalid sliding-window length.")
+
+    row = {
+        "cycle": float(df.iloc[end_idx]["cycle"]),
+        "soh_reference": float(
+            df.iloc[end_idx]["_soh_reference"]
+        ) if pd.notna(
+            df.iloc[end_idx]["_soh_reference"]
+        ) else np.nan,
+        "rul_reference": float(
+            df.iloc[end_idx]["_rul_reference"]
+        ) if pd.notna(
+            df.iloc[end_idx]["_rul_reference"]
+        ) else np.nan,
+    }
+
+    next_obj1_soh = previous_obj1_soh
+
+    # --------------------------------------------------------
+    # Baseline LSTM
+    # --------------------------------------------------------
+    if "Baseline LSTM" in models:
+        try:
+            item = models["Baseline LSTM"]
+            x = scale_input(item["x_scaler"], raw_window)
+
+            pred = item["model"](x)[0].detach().cpu().numpy()
+
+            soh = (
+                float(pred[0]) * item["soh_scale"]
+                + item["soh_mean"]
             )
 
-        scaled_features[name] = transformed.astype(np.float32)
+            rul = inverse_rul(
+                item["rul_scaler"],
+                float(pred[1]),
+            )
 
-    initial_capacity = float(battery_df.iloc[0]["capacity"])
+            row[SOH_COLUMNS["Baseline LSTM"]] = float(
+                np.clip(soh, 0.0, 1.05)
+            )
+            row[RUL_COLUMNS["Baseline LSTM"]] = max(
+                0.0, rul
+            )
 
-    if not np.isfinite(initial_capacity) or initial_capacity <= 0:
-        raise ValueError("Initial capacity must be positive.")
+        except Exception as exc:
+            row[SOH_COLUMNS["Baseline LSTM"]] = np.nan
+            row[RUL_COLUMNS["Baseline LSTM"]] = np.nan
+            row["Baseline LSTM error"] = str(exc)
 
-    # Objective 1 starts from SoH at the last observed input cycle.
-    running_obj1_soh = float(np.clip(
-        battery_df.loc[SEQ_LEN - 1, "capacity"] / initial_capacity,
-        0.0,
-        1.0,
-    ))
+    # --------------------------------------------------------
+    # Objective 1 PI-GLSTM
+    # --------------------------------------------------------
+    if "Objective 1 PI-GLSTM" in models:
+        try:
+            item = models["Objective 1 PI-GLSTM"]
+            x = scale_input(item["x_scaler"], raw_window)
 
-    rows = []
+            delta, rul_scaled = item["model"](x)
 
-    for target_idx in range(SEQ_LEN, len(battery_df)):
-        row = {
-            "battery_id": str(selected_battery),
-            "cycle": float(battery_df.loc[target_idx, "cycle"]),
-            "actual_soh": battery_df.loc[target_idx, "soh"],
-            "actual_rul": battery_df.loc[target_idx, "rul"],
-        }
+            delta_value = float(
+                delta[0].detach().cpu().item()
+            )
 
-        for name, entry in artifacts.items():
-            x = scaled_features[name][target_idx - SEQ_LEN:target_idx]
+            # Apply the non-negative degradation increment
+            # progressively to the previous SoH estimate.
+            next_obj1_soh = max(
+                0.0,
+                previous_obj1_soh - delta_value,
+            )
 
-            x_tensor = torch.as_tensor(
-                x[None, :, :],
+            rul = inverse_rul(
+                item["rul_scaler"],
+                float(rul_scaled[0].detach().cpu().item()),
+            )
+
+            row[SOH_COLUMNS["Objective 1 PI-GLSTM"]] = float(
+                np.clip(next_obj1_soh, 0.0, 1.05)
+            )
+            row[RUL_COLUMNS["Objective 1 PI-GLSTM"]] = max(
+                0.0, rul
+            )
+
+        except Exception as exc:
+            row[SOH_COLUMNS["Objective 1 PI-GLSTM"]] = np.nan
+            row[RUL_COLUMNS["Objective 1 PI-GLSTM"]] = np.nan
+            row["Objective 1 PI-GLSTM error"] = str(exc)
+
+    # --------------------------------------------------------
+    # Objective 2 Transfer PI-GLSTM
+    # --------------------------------------------------------
+    if "Objective 2 Transfer PI-GLSTM" in models:
+        try:
+            item = models["Objective 2 Transfer PI-GLSTM"]
+            x = scale_input(item["x_scaler"], raw_window)
+
+            model_initial_capacity = item.get(
+                "initial_capacity"
+            )
+
+            if (
+                model_initial_capacity is None
+                or not np.isfinite(model_initial_capacity)
+                or model_initial_capacity <= 0
+            ):
+                model_initial_capacity = dataset_initial_capacity
+
+            # Use the last observed capacity in the window as
+            # the current health anchor.
+            anchor_capacity = float(
+                raw_window["capacity"].iloc[-1]
+            )
+
+            anchor_soh = np.clip(
+                anchor_capacity / model_initial_capacity,
+                0.0,
+                1.0,
+            )
+
+            anchor_tensor = torch.tensor(
+                [anchor_soh],
                 dtype=torch.float32,
                 device=DEVICE,
             )
 
-            model = entry["model"]
-
-            with torch.inference_mode():
-
-                if name == "Baseline LSTM":
-                    prediction = model(x_tensor)
-
-                    if prediction.ndim != 2 or prediction.shape[1] != 2:
-                        raise ValueError(
-                            "Baseline model must return shape (batch, 2); "
-                            f"received {tuple(prediction.shape)}."
-                        )
-
-                    soh_transformed = float(prediction[0, 0].item())
-                    soh = (
-                        soh_transformed * entry["soh_scale"]
-                        + entry["soh_mean"]
-                    )
-
-                    rul = inverse_rul(
-                        entry["rul_scaler"],
-                        float(prediction[0, 1].item()),
-                    )
-
-                    row["Baseline LSTM SoH"] = float(
-                        np.clip(soh, 0.0, 1.05)
-                    )
-                    row["Baseline LSTM RUL"] = rul
-
-                elif name == "Objective 1 PI-GLSTM":
-                    delta, rul_scaled = model(x_tensor)
-                    delta_value = max(0.0, float(delta.item()))
-
-                    running_obj1_soh = max(
-                        0.0,
-                        running_obj1_soh - delta_value,
-                    )
-
-                    row["Objective 1 PI-GLSTM SoH"] = running_obj1_soh
-                    row["Objective 1 PI-GLSTM Delta"] = delta_value
-                    row["Objective 1 PI-GLSTM RUL"] = inverse_rul(
-                        entry["rul_scaler"],
-                        float(rul_scaled.item()),
-                    )
-
-                elif name == "Objective 2 Transfer PI-GLSTM":
-                    anchor_value = float(np.clip(
-                        battery_df.loc[target_idx - 1, "capacity"]
-                        / initial_capacity,
-                        0.0,
-                        1.0,
-                    ))
-
-                    anchor = torch.tensor(
-                        [anchor_value],
-                        dtype=torch.float32,
-                        device=DEVICE,
-                    )
-
-                    soh, rul_scaled = model(x_tensor, anchor)
-
-                    row["Objective 2 Transfer PI-GLSTM SoH"] = float(
-                        soh.item()
-                    )
-                    row["Objective 2 Transfer PI-GLSTM RUL"] = inverse_rul(
-                        entry["rul_scaler"],
-                        float(rul_scaled.item()),
-                    )
-
-        rows.append(row)
-
-    results = pd.DataFrame(rows)
-
-    for col in results.columns:
-        if col.endswith(" SoH"):
-            results[col] = results[col].clip(0.0, 1.05)
-
-    return results
-
-
-# ============================================================
-# METRICS
-# ============================================================
-
-def compute_metrics(model_name, target_name, y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-
-    valid = np.isfinite(y_true) & np.isfinite(y_pred)
-    y_true = y_true[valid]
-    y_pred = y_pred[valid]
-
-    if len(y_true) == 0:
-        return {
-            "Model": model_name,
-            "Target": target_name,
-            "Samples": 0,
-            "MAE": np.nan,
-            "RMSE": np.nan,
-            "R²": np.nan,
-            "MAPE (%)": np.nan,
-        }
-
-    nonzero = np.abs(y_true) > 1e-8
-
-    mape = (
-        np.mean(
-            np.abs(
-                (y_true[nonzero] - y_pred[nonzero])
-                / np.abs(y_true[nonzero])
+            soh, rul_scaled = item["model"](
+                x,
+                anchor_tensor,
             )
-        ) * 100
-        if nonzero.any()
-        else np.nan
-    )
 
-    return {
-        "Model": model_name,
-        "Target": target_name,
-        "Samples": len(y_true),
-        "MAE": mean_absolute_error(y_true, y_pred),
-        "RMSE": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "R²": r2_score(y_true, y_pred) if len(y_true) > 1 else np.nan,
-        "MAPE (%)": mape,
-    }
+            soh_value = float(
+                soh[0].detach().cpu().item()
+            )
 
+            rul = inverse_rul(
+                item["rul_scaler"],
+                float(rul_scaled[0].detach().cpu().item()),
+            )
 
-def build_metrics_table(results, use_soh_reference, use_rul_reference):
-    metrics = []
+            row[SOH_COLUMNS["Objective 2 Transfer PI-GLSTM"]] = float(
+                np.clip(soh_value, 0.0, 1.05)
+            )
+            row[RUL_COLUMNS["Objective 2 Transfer PI-GLSTM"]] = max(
+                0.0, rul
+            )
 
-    for model_name in MODEL_ORDER:
-        for target, pred_col, actual_col, has_reference in [
-            (
-                "SoH",
-                f"{model_name} SoH",
-                "actual_soh",
-                use_soh_reference,
-            ),
-            (
-                "RUL",
-                f"{model_name} RUL",
-                "actual_rul",
-                use_rul_reference,
-            ),
-        ]:
-            if has_reference and pred_col in results.columns:
-                metrics.append(
-                    compute_metrics(
-                        model_name,
-                        target,
-                        results[actual_col],
-                        results[pred_col],
-                    )
-                )
+        except Exception as exc:
+            row[SOH_COLUMNS["Objective 2 Transfer PI-GLSTM"]] = np.nan
+            row[RUL_COLUMNS["Objective 2 Transfer PI-GLSTM"]] = np.nan
+            row["Objective 2 Transfer PI-GLSTM error"] = str(exc)
 
-    return pd.DataFrame(metrics)
+    return row, next_obj1_soh
 
 
 # ============================================================
-# CHARTS AND SUMMARY CARDS
+# STREAMING GRAPH RENDERING
 # ============================================================
 
-def make_prediction_chart(
-    results,
-    prediction_columns,
-    title,
-    y_label,
-    percentage=False,
-    show_reference=False,
-    target="soh",
+def build_soh_figure(
+    history: pd.DataFrame,
+    title: str,
+    show_reference: bool,
 ):
-    fig, ax = plt.subplots(figsize=(12, 5.5))
+    fig = go.Figure()
+
+    if history.empty:
+        fig.update_layout(
+            title=title,
+            xaxis_title="Battery Cycle",
+            yaxis_title="State of Health",
+            template="plotly_white",
+            height=440,
+        )
+        return fig
 
     if show_reference:
-        actual_col = "actual_soh" if target == "soh" else "actual_rul"
-
-        if actual_col in results.columns:
-            actual = results[actual_col].to_numpy(dtype=float)
-
-            if percentage:
-                actual = actual * 100.0
-
-            if np.isfinite(actual).any():
-                ax.plot(
-                    results["cycle"],
-                    actual,
-                    label="Reference",
-                    color="#111827",
-                    linestyle="--",
-                    linewidth=2.5,
-                )
-
-    for column, label in prediction_columns:
-        if column not in results.columns:
-            continue
-
-        values = results[column].to_numpy(dtype=float)
-
-        if percentage:
-            values = values * 100.0
-
-        ax.plot(
-            results["cycle"],
-            values,
-            label=label,
-            linewidth=2.2,
-            color=MODEL_COLORS.get(label),
+        fig.add_trace(
+            go.Scatter(
+                x=history["cycle"],
+                y=history["soh_reference"] * 100,
+                mode="lines",
+                name="Reference SoH",
+                line=dict(
+                    color="#64748B",
+                    width=2,
+                    dash="dash",
+                ),
+                connectgaps=False,
+            )
         )
 
-    ax.set_title(title, fontsize=15, fontweight="bold")
-    ax.set_xlabel("Battery Cycle")
-    ax.set_ylabel(y_label)
-    ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="best", fontsize=9)
-    fig.tight_layout()
+    for name, column in SOH_COLUMNS.items():
+        if column not in history.columns:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=history["cycle"],
+                y=history[column] * 100,
+                mode="lines+markers",
+                name=name,
+                line=dict(
+                    color=MODEL_COLORS[name],
+                    width=2.5,
+                ),
+                marker=dict(size=4),
+                connectgaps=False,
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Battery Cycle",
+        yaxis_title="SoH (%)",
+        yaxis=dict(
+            rangemode="tozero",
+            range=[0, 105],
+        ),
+        hovermode="x unified",
+        template="plotly_white",
+        height=440,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+        margin=dict(l=20, r=20, t=80, b=30),
+    )
 
     return fig
 
 
-def add_metric_cards(results):
-    latest = results.iloc[-1]
-    columns = st.columns(5)
- 
-    cards = [
-        ("Current cycle", f"{latest['cycle']:.0f}"),
-        (
-            "Baseline SoH",
-            f"{latest['Baseline LSTM SoH'] * 100:.2f}%"
-            if pd.notna(latest.get("Baseline LSTM SoH", np.nan))
-            else "N/A",
-        ),
-        (
-            "Objective 1 SoH",
-            f"{latest['Objective 1 PI-GLSTM SoH'] * 100:.2f}%"
-            if pd.notna(latest.get("Objective 1 PI-GLSTM SoH", np.nan))
-            else "N/A",
-        ),
-        (
-            "Objective 1 RUL",
-            f"{latest['Objective 1 PI-GLSTM RUL']:.1f} cycles"
-            if pd.notna(latest.get("Objective 1 PI-GLSTM RUL", np.nan))
-            else "N/A",
-        ),
-        (
-            "Objective 2 SoH",
-            f"{latest['Objective 2 Transfer PI-GLSTM SoH'] * 100:.2f}%"
-            if pd.notna(latest.get("Objective 2 Transfer PI-GLSTM SoH", np.nan))
-            else "N/A",
-        ),
-        (
-            "Objective 2 RUL",
-            f"{latest['Objective 2 Transfer PI-GLSTM RUL']:.1f} cycles"
-            if pd.notna(latest.get("Objective 2 Transfer PI-GLSTM RUL", np.nan))
-            else "N/A",
-        ),
-    ]
+def build_rul_figure(
+    history: pd.DataFrame,
+    title: str,
+    show_reference: bool,
+):
+    fig = go.Figure()
 
-    
-    for column, (label, value) in zip(columns, cards):
-        with column:
-            st.metric(label, value)
+    if history.empty:
+        fig.update_layout(
+            title=title,
+            xaxis_title="Battery Cycle",
+            yaxis_title="Remaining Useful Life (cycles)",
+            template="plotly_white",
+            height=440,
+        )
+        return fig
+
+    if show_reference:
+        fig.add_trace(
+            go.Scatter(
+                x=history["cycle"],
+                y=history["rul_reference"],
+                mode="lines",
+                name="Reference RUL",
+                line=dict(
+                    color="#64748B",
+                    width=2,
+                    dash="dash",
+                ),
+                connectgaps=False,
+            )
+        )
+
+    for name, column in RUL_COLUMNS.items():
+        if column not in history.columns:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=history["cycle"],
+                y=history[column],
+                mode="lines+markers",
+                name=name,
+                line=dict(
+                    color=MODEL_COLORS[name],
+                    width=2.5,
+                ),
+                marker=dict(size=4),
+                connectgaps=False,
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Battery Cycle",
+        yaxis_title="RUL (cycles)",
+        yaxis=dict(rangemode="tozero"),
+        hovermode="x unified",
+        template="plotly_white",
+        height=440,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+        margin=dict(l=20, r=20, t=80, b=30),
+    )
+
+    return fig
 
 
 # ============================================================
-# STREAMLIT USER INTERFACE
+# SESSION STATE
 # ============================================================
 
-st.title("🔋 PI-GLSTM Battery Prognostics Dashboard")
+DEFAULT_STATE = {
+    "dataset_hash": None,
+    "stream_running": False,
+    "stream_index": 0,
+    "stream_history": [],
+    "stream_tick": 0,
+    "obj1_previous_soh": None,
+    "last_error": None,
+}
+
+for key, value in DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def reset_stream(initial_soh: float | None = None):
+    st.session_state.stream_running = False
+    st.session_state.stream_index = 0
+    st.session_state.stream_history = []
+    st.session_state.stream_tick = 0
+    st.session_state.obj1_previous_soh = initial_soh
+    st.session_state.last_error = None
+
+
+# ============================================================
+# USER INTERFACE
+# ============================================================
+
+st.title("🔋 Battery Prognostics")
 st.caption(
-    "Cycle-by-cycle SoH and RUL prediction, model comparison, "
-    "live simulation, and physical-consistency evaluation."
+    "Progressive SoH and RUL inference across Baseline LSTM, "
+    "Objective 1 PI-GLSTM, and Objective 2 Transfer PI-GLSTM."
 )
 
 with st.sidebar:
-    st.header("Dashboard Settings")
-    st.write(f"**Device:** `{DEVICE}`")
-    st.write(f"**Sequence length:** `{SEQ_LEN}` cycles")
+    st.header("Simulation settings")
 
     uploaded_file = st.file_uploader(
-        "Upload cycle-level battery CSV",
+        "Upload battery-cycle CSV",
         type=["csv"],
         help=(
-            "Required columns: cycle, voltage, temperature, capacity. "
-            "Optional columns: battery_id, soh, rul."
+            "Required columns: cycle, voltage, temperature, "
+            "capacity. SoH and RUL reference columns are optional."
         ),
     )
 
     st.divider()
-    st.subheader("Live simulation")
 
-    live_mode = st.checkbox(
-        "Animate predictions cycle by cycle",
-        value=False,
+    playback_label = st.selectbox(
+        "Playback speed",
+        options=[
+            "Slow — 1.0 second/cycle",
+            "Medium — 0.3 seconds/cycle",
+            "Fast — 0.05 seconds/cycle",
+        ],
+        index=1,
     )
 
-    playback_delay = st.slider(
-        "Delay per cycle (seconds)",
-        min_value=0.05,
-        max_value=1.0,
-        value=0.2,
-        step=0.05,
-    )
+    playback_intervals = {
+        "Slow — 1.0 second/cycle": 1.0,
+        "Medium — 0.3 seconds/cycle": 0.3,
+        "Fast — 0.05 seconds/cycle": 0.05,
+    }
 
-    max_display_cycles = st.number_input(
-        "Maximum prediction cycles (0 = all)",
-        min_value=0,
-        max_value=10000,
-        value=0,
-        step=10,
-    )
+    playback_seconds = playback_intervals[playback_label]
 
-
-# ============================================================
-# ARTIFACT STATUS
-# ============================================================
-
-st.subheader("Model artifact status")
-
-status_cols = st.columns(3)
-
-for i, (name, paths) in enumerate(MODEL_FILES.items()):
-    with status_cols[i]:
-        st.markdown(f"**{name}**")
-
-        required = [
-            paths["model"],
-            paths["x_scaler"],
-            paths["rul_scaler"],
-        ]
-
-        if name == "Baseline LSTM":
-            required.append(paths["output_scaling"])
-
-        missing = [p.name for p in required if not p.is_file()]
-
-        if missing:
-            st.warning("Missing: " + ", ".join(missing))
-        else:
-            st.success("Required artifacts found")
-
-
-if uploaded_file is None:
-    st.info(
-        "Upload a cycle-level CSV to begin. At least 11 rows are needed "
-        "per battery for the first next-cycle prediction."
-    )
-
-    st.markdown("### Expected CSV structure")
-
-    st.dataframe(
-        pd.DataFrame({
-            "battery_id": ["B0005", "B0005", "B0005"],
-            "cycle": [1, 2, 3],
-            "voltage": [4.18, 4.15, 4.12],
-            "temperature": [24.5, 24.8, 25.1],
-            "capacity": [1.85, 1.83, 1.81],
-            "soh": [1.00, 0.989, 0.978],
-            "rul": [100, 99, 98],
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.stop()
-
-
-# ============================================================
-# LOAD DATA AND MODELS
-# ============================================================
-
-try:
-    uploaded_df = pd.read_csv(uploaded_file)
-    cycle_df, soh_reference, rul_reference = prepare_cycle_data(uploaded_df)
-
-except Exception as exc:
-    st.error(f"Could not prepare the uploaded CSV: {exc}")
-    st.stop()
-
-artifacts, model_errors = load_available_models()
-
-with st.expander(
-    "Model loading diagnostics",
-    expanded=bool(model_errors),
-):
-    for name in artifacts:
-        st.success(f"{name}: loaded successfully.")
-
-    for name, error in model_errors.items():
-        st.warning(f"{name}: {error}")
-
-if not artifacts:
-    st.error(
-        "No supported model could be loaded. Check the diagnostics, "
-        "checkpoint files, and scalers."
-    )
-    st.stop()
-
-batteries = sorted(cycle_df["battery_id"].astype(str).unique())
-
-selected_battery = st.sidebar.selectbox(
-    "Select battery",
-    batteries,
-)
-
-battery_rows = cycle_df[
-    cycle_df["battery_id"].astype(str) == str(selected_battery)
-]
-
-if len(battery_rows) <= SEQ_LEN:
-    st.error(
-        f"Battery {selected_battery} has {len(battery_rows)} cycle rows. "
-        f"At least {SEQ_LEN + 1} are required."
-    )
-    st.stop()
-
-try:
-    all_results = run_predictions(
-        cycle_df,
-        artifacts,
-        selected_battery,
-        max_cycles=(
-            int(max_display_cycles)
-            if max_display_cycles > 0
-            else None
+    show_reference = st.checkbox(
+        "Show reference curves",
+        value=True,
+        help=(
+            "If the CSV lacks measured targets, the app labels "
+            "capacity-derived SoH and cycle-derived RUL as proxies."
         ),
     )
 
-except Exception as exc:
-    st.error(f"Inference failed: {type(exc).__name__}: {exc}")
-    st.exception(exc)
-    st.stop()
+    st.divider()
 
-if all_results.empty:
-    st.warning("No predictions were generated.")
-    st.stop()
+    st.caption(f"Inference device: `{DEVICE}`")
+    st.caption(f"Sequence length: `{SEQ_LEN}` cycles")
 
 
-# ============================================================
-# SELECT AVAILABLE PREDICTION COLUMNS
-# ============================================================
+# Load models once.
+models, model_errors = load_models()
 
-soh_columns = [
-    (f"{name} SoH", name)
-    for name in MODEL_ORDER
-    if f"{name} SoH" in all_results.columns
-]
-
-rul_columns = [
-    (f"{name} RUL", name)
-    for name in MODEL_ORDER
-    if f"{name} RUL" in all_results.columns
-]
-
-
-# ============================================================
-# LIVE OR STATIC CHARTS
-# ============================================================
-
-if live_mode:
-    st.subheader("Live prediction stream")
-
-    status = st.empty()
-    progress = st.progress(0)
-    metrics_placeholder = st.empty()
-    soh_chart_placeholder = st.empty()
-    rul_chart_placeholder = st.empty()
-    table_placeholder = st.empty()
-
-    for i in range(1, len(all_results) + 1):
-        current = all_results.iloc[:i].copy()
-
-        with metrics_placeholder.container():
-            add_metric_cards(current)
-
-        soh_fig = make_prediction_chart(
-            current,
-            soh_columns,
-            "Live State of Health Comparison",
-            "State of Health (%)",
-            percentage=True,
-            show_reference=soh_reference,
-            target="soh",
-        )
-
-        soh_chart_placeholder.pyplot(
-            soh_fig,
-            use_container_width=True,
-        )
-        plt.close(soh_fig)
-
-        rul_fig = make_prediction_chart(
-            current,
-            rul_columns,
-            "Live Remaining Useful Life Comparison",
-            "Remaining Useful Life (cycles)",
-            show_reference=rul_reference,
-            target="rul",
-        )
-
-        rul_chart_placeholder.pyplot(
-            rul_fig,
-            use_container_width=True,
-        )
-        plt.close(rul_fig)
-
-        table_placeholder.dataframe(
-            current.tail(10).round(5),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        progress.progress(i / len(all_results))
-        status.info(
-            f"Streaming cycle {current.iloc[-1]['cycle']:.0f} "
-            f"({i}/{len(all_results)})"
-        )
-
-        time.sleep(playback_delay)
-
-    status.success("Live simulation completed.")
-
-else:
-    st.subheader("Current battery status")
-    add_metric_cards(all_results)
-
-    st.subheader("State of Health (SoH)")
-
-    soh_fig = make_prediction_chart(
-        all_results,
-        soh_columns,
-        "State of Health Across Battery Cycles",
-        "State of Health (%)",
-        percentage=True,
-        show_reference=soh_reference,
-        target="soh",
-    )
-
-    st.pyplot(soh_fig, use_container_width=True)
-    plt.close(soh_fig)
-
-    st.subheader("Remaining Useful Life (RUL)")
-
-    rul_fig = make_prediction_chart(
-        all_results,
-        rul_columns,
-        "Remaining Useful Life Across Battery Cycles",
-        "Remaining Useful Life (cycles)",
-        show_reference=rul_reference,
-        target="rul",
-    )
-
-    st.pyplot(rul_fig, use_container_width=True)
-    plt.close(rul_fig)
-
-
-# ============================================================
-# RESULTS TABLE AND CSV EXPORT
-# ============================================================
-
-st.subheader("Prediction results")
-
-st.dataframe(
-    all_results.round(5),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.download_button(
-    "Download prediction results (CSV)",
-    data=all_results.to_csv(index=False).encode("utf-8"),
-    file_name=f"{selected_battery}_prognostics_predictions.csv",
-    mime="text/csv",
-)
-
-
-# ============================================================
-# EVALUATION METRICS
-# ============================================================
-
-st.subheader("Model performance metrics")
-
-if soh_reference or rul_reference:
-    metric_table = build_metrics_table(
-        all_results,
-        use_soh_reference=soh_reference,
-        use_rul_reference=rul_reference,
-    )
-
-    if not metric_table.empty:
-        st.dataframe(
-            metric_table.round(5),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info(
-            "No metrics are available for the supplied reference labels "
-            "and successfully loaded models."
-        )
-
-else:
-    st.info(
-        "Independent SoH and RUL reference labels were not supplied. "
-        "Labels derived from capacity or maximum cycle are proxies, "
-        "not independent ground truth."
-    )
-
-
-# ============================================================
-# PHYSICAL CONSISTENCY AUDIT
-# ============================================================
-
-st.subheader("SoH monotonicity audit")
-
-
-def count_upward_violations(values):
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-
-    if len(values) < 2:
-        return 0, 0
-
-    return int((np.diff(values) > 1e-8).sum()), len(values) - 1
-
-
-audit_rows = []
-
-for name in MODEL_ORDER:
-    col = f"{name} SoH"
-
-    if col not in all_results.columns:
-        continue
-
-    violations, transitions = count_upward_violations(
-        all_results[col]
-    )
-
-    audit_rows.append({
-        "Model": name,
-        "Upward SoH Transitions": violations,
-        "Transitions Checked": transitions,
-        "Strictly Non-Increasing": violations == 0,
-    })
-
-if audit_rows:
-    st.dataframe(
-        pd.DataFrame(audit_rows),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-st.caption(
-    "Objective 1 uses a recursive non-negative degradation rollout. "
-    "Objective 2 predicts a bounded fraction of the preceding-cycle "
-    "anchor SoH. Baseline LSTM has no enforced monotonicity constraint."
-)
-
-
-# ============================================================
-# MODEL AND INPUT DETAILS
-# ============================================================
-
-with st.expander("Model and input details"):
-    st.write("**Model input features**")
-    st.code(", ".join(FEATURES))
-
-    st.write("**Sequence length**")
-    st.write(f"{SEQ_LEN} consecutive cycle-level observations")
-
-    st.write("**Selected battery**")
-    st.write(str(selected_battery))
-
-    st.write("**Input rows for this battery**")
-    st.write(len(battery_rows))
-
-    st.write("**Prediction rows**")
-    st.write(len(all_results))
-
-    st.write("**Inference device**")
-    st.write(str(DEVICE))
-
-    for model_name, paths in MODEL_FILES.items():
-        st.markdown(f"**{model_name}**")
-        st.write(f"Checkpoint: `{paths['model']}`")
-        st.write(f"Feature scaler: `{paths['x_scaler']}`")
-        st.write(f"RUL scaler: `{paths['rul_scaler']}`")
-
-        if model_name == "Baseline LSTM":
-            st.write(
-                f"SoH output scaling: `{paths['output_scaling']}`"
+with st.expander("Model availability", expanded=bool(model_errors)):
+    for name in MODEL_FILES:
+        if name in models:
+            st.success(f"{name}: loaded")
+        else:
+            st.error(
+                f"{name}: unavailable — "
+                f"{model_errors.get(name, 'Unknown loading error')}"
             )
 
-st.success("Battery prognostics analysis completed.")
+if not models:
+    st.error(
+        "No model could be loaded. Check the checkpoint and scaler "
+        "paths under the model_artifacts directory."
+    )
+    st.stop()
+
+if uploaded_file is None:
+    st.info(
+        "Upload a battery-cycle CSV to begin streaming model predictions."
+    )
+
+    st.markdown(
+        """
+        **Expected input features**
+
+        - `cycle`
+        - `voltage`
+        - `temperature`
+        - `capacity`
+
+        Optional reference columns: `soh` and `rul`.
+        """
+    )
+
+    st.stop()
+
+
+# ------------------------------------------------------------
+# Read and prepare the uploaded dataset
+# ------------------------------------------------------------
+
+file_bytes = uploaded_file.getvalue()
+file_hash = hashlib.md5(file_bytes).hexdigest()
+
+try:
+    raw_df = pd.read_csv(uploaded_file)
+
+    (
+        battery_df,
+        dataset_initial_capacity,
+        has_measured_soh,
+        has_measured_rul,
+    ) = prepare_battery_data(raw_df)
+
+except Exception as exc:
+    st.error(f"Unable to prepare dataset: {exc}")
+    st.stop()
+
+
+# Reset stream whenever the uploaded dataset changes.
+if st.session_state.dataset_hash != file_hash:
+    initial_soh = float(
+        battery_df["capacity"].iloc[SEQ_LEN - 1]
+        / dataset_initial_capacity
+    )
+
+    reset_stream(initial_soh)
+    st.session_state.dataset_hash = file_hash
+
+
+total_steps = len(battery_df) - SEQ_LEN + 1
+
+reference_description = []
+
+if show_reference:
+    if has_measured_soh:
+        reference_description.append("SoH: supplied reference")
+    else:
+        reference_description.append("SoH: capacity-derived proxy")
+
+    if has_measured_rul:
+        reference_description.append("RUL: supplied reference")
+    else:
+        reference_description.append("RUL: cycle-derived proxy")
+
+st.caption(
+    f"Dataset: {len(battery_df):,} valid cycles · "
+    f"{total_steps:,} prediction windows · "
+    f"{' | '.join(reference_description) if reference_description else 'Reference curves hidden'}"
+)
+
+
+# ------------------------------------------------------------
+# Streaming controls
+# ------------------------------------------------------------
+
+control_start, control_pause, control_reset, control_spacer = st.columns(
+    [1.1, 1.2, 0.9, 3]
+)
+
+with control_start:
+    if st.button(
+        "▶ Start" if not st.session_state.stream_running else "▶ Running",
+        disabled=(
+            st.session_state.stream_running
+            or st.session_state.stream_index >= total_steps
+        ),
+        use_container_width=True,
+    ):
+        st.session_state.stream_running = True
+        st.rerun()
+
+with control_pause:
+    if st.button(
+        "⏸ Pause" if st.session_state.stream_running else "▶ Resume",
+        disabled=(
+            st.session_state.stream_index >= total_steps
+        ),
+        use_container_width=True,
+    ):
+        st.session_state.stream_running = (
+            not st.session_state.stream_running
+        )
+        st.rerun()
+
+with control_reset:
+    if st.button("↺ Reset", use_container_width=True):
+        initial_soh = float(
+            battery_df["capacity"].iloc[SEQ_LEN - 1]
+            / dataset_initial_capacity
+        )
+        reset_stream(initial_soh)
+        st.rerun()
+
+
+# ------------------------------------------------------------
+# Progress and live prediction indicators
+# ------------------------------------------------------------
+
+current_step = st.session_state.stream_index
+progress = min(current_step / total_steps, 1.0)
+
+st.progress(progress, text=f"Streaming progress: {progress:.1%}")
+
+history_df = pd.DataFrame(
+    st.session_state.stream_history
+)
+
+metric_cols = st.columns(5)
+
+latest = (
+    history_df.iloc[-1].to_dict()
+    if not history_df.empty
+    else {}
+)
+
+with metric_cols[0]:
+    if latest:
+        st.metric(
+            "Current cycle",
+            f"{latest['cycle']:.0f}",
+        )
+    else:
+        st.metric("Current cycle", "Waiting")
+
+with metric_cols[1]:
+    value = latest.get(
+        SOH_COLUMNS["Baseline LSTM"],
+        np.nan,
+    )
+    st.metric(
+        "Baseline SoH",
+        f"{value * 100:.2f}%" if pd.notna(value) else "—",
+    )
+
+with metric_cols[2]:
+    value = latest.get(
+        SOH_COLUMNS["Objective 1 PI-GLSTM"],
+        np.nan,
+    )
+    st.metric(
+        "Objective 1 SoH",
+        f"{value * 100:.2f}%" if pd.notna(value) else "—",
+    )
+
+with metric_cols[3]:
+    value = latest.get(
+        SOH_COLUMNS["Objective 2 Transfer PI-GLSTM"],
+        np.nan,
+    )
+    st.metric(
+        "Objective 2 SoH",
+        f"{value * 100:.2f}%" if pd.notna(value) else "—",
+    )
+
+with metric_cols[4]:
+    value = latest.get(
+        RUL_COLUMNS["Objective 2 Transfer PI-GLSTM"],
+        np.nan,
+    )
+    st.metric(
+        "Objective 2 RUL",
+        f"{value:.1f} cycles" if pd.notna(value) else "—",
+    )
+
+
+# ------------------------------------------------------------
+# Live graph fragment
+#
+# The fragment refreshes every 0.05 seconds. A tick counter
+# throttles the actual inference to the selected playback speed.
+# ------------------------------------------------------------
+
+@st.fragment(run_every=0.05)
+def streaming_dashboard():
+    if (
+        st.session_state.stream_running
+        and st.session_state.stream_index < total_steps
+    ):
+        st.session_state.stream_tick += 1
+
+        required_ticks = max(
+            1,
+            round(playback_seconds / 0.05),
+        )
+
+        if st.session_state.stream_tick >= required_ticks:
+            st.session_state.stream_tick = 0
+
+            step_index = st.session_state.stream_index
+            previous_soh = st.session_state.obj1_previous_soh
+
+            if previous_soh is None:
+                previous_soh = float(
+                    battery_df["capacity"].iloc[SEQ_LEN - 1]
+                    / dataset_initial_capacity
+                )
+
+            try:
+                prediction, next_obj1_soh = predict_one_cycle(
+                    models=models,
+                    df=battery_df,
+                    step_index=step_index,
+                    previous_obj1_soh=previous_soh,
+                    dataset_initial_capacity=dataset_initial_capacity,
+                )
+
+                st.session_state.stream_history.append(
+                    prediction
+                )
+
+                st.session_state.obj1_previous_soh = (
+                    next_obj1_soh
+                )
+
+                st.session_state.stream_index += 1
+                st.session_state.last_error = None
+
+            except Exception as exc:
+                st.session_state.last_error = str(exc)
+                st.session_state.stream_running = False
+
+    current_history = pd.DataFrame(
+        st.session_state.stream_history
+    )
+
+    if st.session_state.last_error:
+        st.error(
+            "Streaming stopped because of an inference error: "
+            + st.session_state.last_error
+        )
+
+    if (
+        st.session_state.stream_index >= total_steps
+        and total_steps > 0
+    ):
+        st.success(
+            "Streaming complete. Reset the simulation to replay "
+            "the battery-cycle sequence."
+        )
+    elif st.session_state.stream_running:
+        st.info(
+            f"Streaming cycle "
+            f"{st.session_state.stream_index + SEQ_LEN - 1:,} "
+            f"of {len(battery_df):,}."
+        )
+    elif st.session_state.stream_index == 0:
+        st.caption("Ready. Press Start to begin the simulation.")
+    else:
+        st.caption("Streaming paused. Resume to continue.")
+
+    soh_fig = build_soh_figure(
+        current_history,
+        "Streaming State of Health (SoH)",
+        show_reference,
+    )
+
+    rul_fig = build_rul_figure(
+        current_history,
+        "Streaming Remaining Useful Life (RUL)",
+        show_reference,
+    )
+
+    graph_col1, graph_col2 = st.columns(2)
+
+    with graph_col1:
+        st.plotly_chart(
+            soh_fig,
+            use_container_width=True,
+            key="streaming_soh_chart",
+        )
+
+    with graph_col2:
+        st.plotly_chart(
+            rul_fig,
+            use_container_width=True,
+            key="streaming_rul_chart",
+        )
+
+
+streaming_dashboard()
+
+
+# ------------------------------------------------------------
+# Optional export of the points revealed during the simulation
+# ------------------------------------------------------------
+
+if not history_df.empty:
+    st.divider()
+
+    export_col, status_col = st.columns([1, 3])
+
+    with export_col:
+        csv_data = history_df.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            "Download streamed predictions",
+            data=csv_data,
+            file_name="battery_streaming_predictions.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with status_col:
+        st.caption(
+            "The export contains only the prediction points that "
+            "have been streamed so far. It does not expose future "
+            "predictions before they are revealed."
+        )

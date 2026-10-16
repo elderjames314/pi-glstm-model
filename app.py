@@ -19,7 +19,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🔋 PI-GLSTM EV BMS: Unified 6-Panel Thesis Command Center")
+st.title("🔋 PI-GLSTM EV BMS Thesis Dashboard")
 st.markdown("Real-time streaming comparison across Standard LSTM, Base PI-GLSTM (Obj 1), and Transfer Learning PI-GLSTM (Obj 2) with comprehensive analytics.")
 
 # ==========================================

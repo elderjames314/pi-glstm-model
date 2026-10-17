@@ -1,7 +1,11 @@
 streamlit
 torch
+plotly
 pandas
 numpy
 matplotlib
 joblib
 scikit-learn
+
+
+ 
